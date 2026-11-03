@@ -97,16 +97,23 @@ def render_feed():
 
 def render_check():
     st.caption("Paste a job posting to get a scam-risk score and an explanation.")
-    text = st.text_area("Job posting text", height=220, placeholder="Paste the job posting here...")
+    mode = st.radio("Input type", ["Paste text", "Paste a link"], horizontal=True)
+    if mode == "Paste text":
+        text = st.text_area("Job posting text", height=220, placeholder="Paste the job posting here...")
+    else:
+        text = st.text_input("Job posting link", placeholder="https://company.com/careers/job-123")
+        st.caption("Some sites (LinkedIn, Naukri) block automated reading. If a link fails, paste the text instead.")
     if st.button("Check posting", type="primary"):
         if not text.strip():
             st.warning("Please paste a job posting first.")
         else:
             try:
-                r = requests.post(f"{API}/predict", json={"text": text}, headers=auth_headers(), timeout=60)
+                endpoint = "/predict" if mode == "Paste text" else "/predict/url"
+                payload = {"text": text} if mode == "Paste text" else {"url": text.strip()}
+                r = requests.post(f"{API}{endpoint}", json=payload, headers=auth_headers(), timeout=60)
                 if r.status_code == 200:
                     st.session_state.result = r.json()
-                    st.session_state.text = text
+                    st.session_state.text = text if mode == "Paste text" else (r.json().get("source_url", text) + "\n" + r.json().get("text_preview", ""))
                     st.session_state.fb = None
                 elif r.status_code == 401:
                     logout("Your session expired. Please log in again.")

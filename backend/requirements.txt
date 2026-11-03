@@ -11,3 +11,8 @@ PyJWT
 bcrypt
 python-dotenv
 python-multipart
+
+beautifulsoup4
+lxml
+
+requests

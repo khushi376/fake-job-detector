@@ -32,6 +32,8 @@ from app.auth import (
     verify_password,
 )
 
+from app.url_fetch import UrlFetchError, fetch_posting_text
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -82,6 +84,7 @@ class Prediction(Base):
     verdict    = Column(String,   nullable=False)
     reasons    = Column(Text,     nullable=False)           # JSON-encoded list[str]
     user_id    = Column(Integer,  ForeignKey("users.id"), nullable=True)
+    source_url = Column(String,   nullable=True)
     timestamp  = Column(DateTime, default=datetime.utcnow)
 
 
@@ -478,6 +481,58 @@ def predict(
         risk_score=final_score,
         verdict=final_verdict,
         reasons=all_reasons,
+    )
+
+
+class UrlRequest(BaseModel):
+    url: str
+
+
+class UrlPredictResponse(PredictResponse):
+    source_url: str
+    text_preview: str
+
+
+@app.post("/predict/url", response_model=UrlPredictResponse, tags=["Inference"])
+def predict_url(
+    req:          UrlRequest,
+    current_user: User = Depends(get_current_user),
+):
+    # Fetch the page safely (SSRF-protected) and extract the posting text
+    try:
+        text = fetch_posting_text(req.url)
+    except UrlFetchError as exc:
+        raise HTTPException(status_code=422, detail=exc.message)
+
+    result         = app_state.predict_fn(text, app_state.bundle)
+    model_score:   float     = result["risk_score"]
+    model_reasons: list[str] = result["reasons"]
+
+    red_reasons, final_score = apply_red_flags(text, model_score)
+    all_reasons   = red_reasons + model_reasons
+    final_verdict = _verdict(final_score)
+
+    db: Session = SessionLocal()
+    try:
+        row = Prediction(
+            text=text,
+            risk_score=final_score,
+            verdict=final_verdict,
+            reasons=json.dumps(all_reasons),
+            user_id=current_user.id,
+            source_url=req.url.strip(),
+        )
+        db.add(row)
+        db.commit()
+    finally:
+        db.close()
+
+    return UrlPredictResponse(
+        risk_score=final_score,
+        verdict=final_verdict,
+        reasons=all_reasons,
+        source_url=req.url.strip(),
+        text_preview=text[:300],
     )
 
 
