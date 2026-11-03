@@ -143,6 +143,82 @@ def render_check():
 
 st.title("🛡️ Fake Job Posting Detector")
 
+def render_admin():
+    import pandas as pd
+    st.subheader("Admin dashboard")
+    try:
+        r = requests.get(f"{API}/admin/stats", headers=auth_headers(), timeout=30)
+    except requests.exceptions.RequestException:
+        st.error("Cannot reach the backend.")
+        return
+    if r.status_code == 401:
+        logout("Your session expired. Please log in again.")
+        st.rerun()
+    if r.status_code != 200:
+        st.error(f"Could not load stats: {api_error(r)}")
+        return
+    s = r.json()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Users", s["users"])
+    c2.metric("Predictions", s["predictions"])
+    c3.metric("Pending feedback", s["feedback_status"].get("pending", 0))
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("**Predictions by verdict**")
+        if s["verdicts"]:
+            st.bar_chart(pd.DataFrame({"count": list(s["verdicts"].values())}, index=list(s["verdicts"].keys())))
+        else:
+            st.write("No data yet.")
+    with col_b:
+        st.markdown("**Feedback by status**")
+        if s["feedback_status"]:
+            st.bar_chart(pd.DataFrame({"count": list(s["feedback_status"].values())}, index=list(s["feedback_status"].keys())))
+        else:
+            st.write("No feedback yet.")
+    st.markdown("**Most common scam patterns detected**")
+    if s["top_patterns"]:
+        st.dataframe(pd.DataFrame(s["top_patterns"]), use_container_width=True, hide_index=True)
+    else:
+        st.write("No patterns yet.")
+    st.divider()
+    st.subheader("Moderation queue")
+    status_pick = st.selectbox("Show feedback with status", ["pending", "approved", "rejected", "all"])
+    try:
+        fr = requests.get(f"{API}/admin/feedback", params={"status": status_pick, "limit": 50}, headers=auth_headers(), timeout=30)
+        items = fr.json() if fr.status_code == 200 else []
+    except requests.exceptions.RequestException:
+        items = []
+    if not items:
+        st.write("Nothing to show.")
+    for it in items:
+        flag = " | DISPUTED" if it["disputed"] else ""
+        title = f"#{it['id']} | user says {it['user_label']} | model score {it['predicted_score']:.0f} | {it['status']}{flag}"
+        with st.expander(title):
+            st.write(f"Submitted by: {it['user_email']}")
+            st.write(it["posting_text"][:600])
+            b1, b2 = st.columns(2)
+            if b1.button("Approve", key=f"ap_{it['id']}"):
+                requests.post(f"{API}/admin/feedback/{it['id']}/review", json={"status": "approved"}, headers=auth_headers(), timeout=30)
+                st.rerun()
+            if b2.button("Reject", key=f"rj_{it['id']}"):
+                requests.post(f"{API}/admin/feedback/{it['id']}/review", json={"status": "rejected"}, headers=auth_headers(), timeout=30)
+                st.rerun()
+    st.divider()
+    st.subheader("Borderline predictions (score 40 to 60)")
+    try:
+        br = requests.get(f"{API}/admin/borderline", headers=auth_headers(), timeout=30)
+        border = br.json() if br.status_code == 200 else []
+    except requests.exceptions.RequestException:
+        border = []
+    if not border:
+        st.write("No borderline predictions yet.")
+    for b in border:
+        with st.expander(f"#{b['id']} | {b['verdict']} | {b['risk_score']:.0f}"):
+            st.write(b["text"][:500])
+            for reason in b["reasons"]:
+                st.write(f"- {reason}")
+
+
 with st.sidebar:
     if st.session_state.token:
         st.write(f"Signed in as **{st.session_state.email}**")
@@ -157,7 +233,12 @@ if st.session_state.msg:
     st.warning(st.session_state.msg)
 
 if st.session_state.token:
-    tab_check, tab_feed = st.tabs(["Check a posting", "Public feed"])
+    if st.session_state.role == "admin":
+        tab_check, tab_feed, tab_admin = st.tabs(["Check a posting", "Public feed", "Admin"])
+        with tab_admin:
+            render_admin()
+    else:
+        tab_check, tab_feed = st.tabs(["Check a posting", "Public feed"])
     with tab_check:
         render_check()
     with tab_feed:

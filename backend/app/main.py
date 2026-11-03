@@ -22,6 +22,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, field_validator
 from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy import func
 
 from app.auth import (
     _get_current_user_from_token,
@@ -565,6 +566,123 @@ def feedback(
         db.close()
 
     return {"message": "Feedback saved."}
+
+
+# ---------------------------------------------------------------------------
+# Admin endpoints (admin role required)
+# ---------------------------------------------------------------------------
+
+class ReviewRequest(BaseModel):
+    status: Literal["approved", "rejected", "pending"]
+
+
+def _is_disputed(label: str, score: float) -> bool:
+    # The user's label disagrees with the model's verdict
+    return (label == "scam" and score < 50) or (label == "genuine" and score >= 50)
+
+
+@app.get("/admin/feedback", tags=["Admin"])
+def admin_list_feedback(
+    status_filter: Optional[str] = Query(default="pending", alias="status"),
+    limit:  int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    admin:  User = Depends(require_admin),
+    db:     Session = Depends(get_db),
+):
+    query = db.query(Feedback, User.email).outerjoin(User, User.id == Feedback.user_id)
+    if status_filter and status_filter != "all":
+        query = query.filter(Feedback.status == status_filter)
+    rows = query.order_by(Feedback.timestamp.desc()).offset(offset).limit(limit).all()
+    return [
+        {
+            "id": fb.id,
+            "posting_text": fb.posting_text[:1000],
+            "predicted_score": fb.predicted_score,
+            "user_label": fb.user_label,
+            "status": fb.status,
+            "disputed": _is_disputed(fb.user_label, fb.predicted_score),
+            "user_email": email,
+            "timestamp": fb.timestamp,
+        }
+        for fb, email in rows
+    ]
+
+
+@app.post("/admin/feedback/{feedback_id}/review", tags=["Admin"])
+def admin_review_feedback(
+    feedback_id: int,
+    req:   ReviewRequest,
+    admin: User = Depends(require_admin),
+    db:    Session = Depends(get_db),
+):
+    row = db.query(Feedback).filter(Feedback.id == feedback_id).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Feedback not found")
+    row.status = req.status
+    db.commit()
+    return {"id": row.id, "status": row.status}
+
+
+@app.get("/admin/borderline", tags=["Admin"])
+def admin_borderline(
+    limit: int = Query(default=20, ge=1, le=200),
+    admin: User = Depends(require_admin),
+    db:    Session = Depends(get_db),
+):
+    rows = (
+        db.query(Prediction)
+        .filter(Prediction.risk_score >= 40, Prediction.risk_score < 60)
+        .order_by(Prediction.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "text": r.text[:500],
+            "risk_score": r.risk_score,
+            "verdict": r.verdict,
+            "reasons": json.loads(r.reasons),
+            "source_url": r.source_url,
+            "timestamp": r.timestamp,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/admin/stats", tags=["Admin"])
+def admin_stats(
+    admin: User = Depends(require_admin),
+    db:    Session = Depends(get_db),
+):
+    verdicts = dict(db.query(Prediction.verdict, func.count(Prediction.id)).group_by(Prediction.verdict).all())
+    fb_status = dict(db.query(Feedback.status, func.count(Feedback.id)).group_by(Feedback.status).all())
+    fb_labels = dict(
+        db.query(Feedback.user_label, func.count(Feedback.id))
+        .filter(Feedback.status == "approved")
+        .group_by(Feedback.user_label)
+        .all()
+    )
+    patterns = {}
+    for (reasons_json,) in db.query(Prediction.reasons).all():
+        try:
+            items = json.loads(reasons_json)
+        except Exception:
+            continue
+        for reason in items:
+            # keep the rule-based red flags, skip model-feature reasons
+            if "risk)" in reason or reason.startswith("Contains wording"):
+                continue
+            patterns[reason] = patterns.get(reason, 0) + 1
+    top_patterns = sorted(patterns.items(), key=lambda kv: -kv[1])[:8]
+    return {
+        "users": db.query(func.count(User.id)).scalar() or 0,
+        "predictions": db.query(func.count(Prediction.id)).scalar() or 0,
+        "verdicts": verdicts,
+        "feedback_status": fb_status,
+        "approved_labels": fb_labels,
+        "top_patterns": [{"pattern": p, "count": c} for p, c in top_patterns],
+    }
 
 
 # ---------------------------------------------------------------------------
