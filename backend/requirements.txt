@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+joblib
+pandas
+scipy
+scikit-learn==1.6.1
+xgboost==3.4.1
