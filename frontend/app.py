@@ -181,6 +181,40 @@ def render_admin():
     else:
         st.write("No patterns yet.")
     st.divider()
+    st.subheader("Model versions and retraining")
+    try:
+        mr = requests.get(f"{API}/admin/models", headers=auth_headers(), timeout=30)
+        info = mr.json() if mr.status_code == 200 else {}
+    except requests.exceptions.RequestException:
+        info = {}
+    versions = info.get("versions", [])
+    if versions:
+        vrows = []
+        for v in versions:
+            m = v.get("metrics", {})
+            vrows.append({"Version": v["version"], "Active": "yes" if v["version"] == info.get("active_version") else "", "Feedback rows": v.get("trained_on_feedback", 0), "Precision": m.get("precision"), "Recall": m.get("recall"), "F1": m.get("f1"), "PR-AUC": m.get("pr_auc"), "Promoted": "yes" if v.get("promoted") else "no", "Created": v.get("created_at", "")})
+        vdf = pd.DataFrame(vrows)
+        st.dataframe(vdf, use_container_width=True, hide_index=True)
+        st.markdown("**Model performance across versions**")
+        st.line_chart(vdf.set_index("Version")[["F1", "PR-AUC"]])
+    else:
+        st.write("No model versions recorded yet.")
+    rstate = info.get("retrain", {})
+    min_fb = st.number_input("Minimum approved feedback rows required", min_value=1, max_value=1000, value=5, step=1)
+    if rstate.get("running"):
+        st.info("Retraining is running. This takes a few minutes. Click Refresh status to check.")
+    if st.button("Retrain now", disabled=bool(rstate.get("running"))):
+        rr = requests.post(f"{API}/admin/retrain", params={"min_feedback": int(min_fb)}, headers=auth_headers(), timeout=30)
+        if rr.status_code in (200, 202):
+            st.success("Retraining started. Click Refresh status in a minute or two.")
+        else:
+            st.error(api_error(rr))
+    if st.button("Refresh status"):
+        st.rerun()
+    if rstate.get("output"):
+        st.markdown(f"**Last retraining output** (exit code {rstate.get('exit_code')}, finished {rstate.get('finished_at')})")
+        st.code(rstate["output"])
+    st.divider()
     st.subheader("Moderation queue")
     status_pick = st.selectbox("Show feedback with status", ["pending", "approved", "rejected", "all"])
     try:

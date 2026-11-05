@@ -8,7 +8,9 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -683,6 +685,60 @@ def admin_stats(
         "approved_labels": fb_labels,
         "top_patterns": [{"pattern": p, "count": c} for p, c in top_patterns],
     }
+
+
+# ---------------------------------------------------------------------------
+# Model registry and retraining (admin only)
+# ---------------------------------------------------------------------------
+
+REGISTRY_PATH = ML_DIR / "models" / "registry.json"
+RETRAIN_STATE = {"running": False, "exit_code": None, "output": "", "finished_at": None}
+RETRAIN_LOCK = threading.Lock()
+
+
+def _run_retrain(min_feedback: int):
+    output = ""
+    code = -1
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(ML_DIR / "retrain.py"), "--min-feedback", str(min_feedback)],
+            capture_output=True, text=True, timeout=1800, cwd=str(ML_DIR.parent),
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+        code = proc.returncode
+        if code == 0 and MODEL_PATH.exists():
+            # hot-reload the active model so no server restart is needed
+            app_state.bundle = joblib.load(MODEL_PATH)
+    except Exception as exc:
+        output = f"Retraining could not run: {exc}"
+    with RETRAIN_LOCK:
+        RETRAIN_STATE.update(running=False, exit_code=code, output=output[-4000:], finished_at=datetime.utcnow().isoformat(timespec="seconds"))
+
+
+@app.get("/admin/models", tags=["Admin"])
+def admin_models(admin: User = Depends(require_admin)):
+    if REGISTRY_PATH.exists():
+        registry = json.loads(REGISTRY_PATH.read_text())
+    else:
+        registry = {"active_version": None, "versions": []}
+    registry["retrain"] = dict(RETRAIN_STATE)
+    return registry
+
+
+@app.post("/admin/retrain", status_code=202, tags=["Admin"])
+def admin_retrain(
+    min_feedback: int = Query(default=5, ge=1, le=1000),
+    admin: User = Depends(require_admin),
+):
+    csv_path = ML_DIR / "data" / "fake_job_postings.csv"
+    if not csv_path.exists():
+        raise HTTPException(status_code=400, detail="Training data not found at ml/data/fake_job_postings.csv")
+    with RETRAIN_LOCK:
+        if RETRAIN_STATE["running"]:
+            raise HTTPException(status_code=409, detail="Retraining is already running.")
+        RETRAIN_STATE.update(running=True, exit_code=None, output="", finished_at=None)
+    threading.Thread(target=_run_retrain, args=(min_feedback,), daemon=True).start()
+    return {"message": "Retraining started. This takes a few minutes."}
 
 
 # ---------------------------------------------------------------------------
